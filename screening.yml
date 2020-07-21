@@ -1,0 +1,639 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Screening Application
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access into the server
+    Type: AWS::EC2::KeyPair::KeyName
+
+  MyVPC:
+    Description: Name of an existing VPC
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnet1:
+    Description: Name of the existing Subnets
+    Type: AWS::EC2::Subnet::Id
+
+  PublicSubnet2:
+    Description: Name of the existing Subnets
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateSubnet1:
+    Description: Name of the existing Subnets
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateSubnet2:
+    Description: Name of the existing Subnets
+    Type: AWS::EC2::Subnet::Id
+
+  InstanceType:
+    Description: Server EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  DBInstanceType:
+    Description: DB instance type
+    Type: String
+    Default: db.t2.small
+    AllowedValues:
+      - db.t2.small
+      - db.t2.medium
+      - db.r3.xlarge
+
+  DatabaseName:
+    Type: String
+    Default: screening
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*" # start with a letter, only alphanumeric characters
+  DatabaseUser:
+    Type: String
+    MinLength: 1
+    MaxLength: 16
+    Default: screening
+    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*" # start with a letter, only alphanumeric characters
+  DatabasePassword:
+    Type: String
+    MinLength: 8
+    MaxLength: 41
+    Default: screening123
+    NoEcho: true
+    AllowedPattern: "[a-zA-Z0-9]*" # Must only contain alphanumeric characters
+
+  SnapToRestore:
+    Type: String
+    Default: "screeningdbsnap"
+    Description: snap id to restore
+
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 106.51.82.81/32
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+
+Conditions:
+  isRestore:
+    !Not [!Equals [!Ref SnapToRestore, ""]]
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-1853ac65
+    us-west-1:
+      AMI: ami-bf5540df
+    eu-west-1:
+      AMI: ami-3bfab942
+    ap-southeast-1:
+      AMI: ami-e2adf99e
+    ap-southeast-2:
+      AMI: ami-43874721
+    ap-south-1:
+      AMI: ami-7c87d913
+      
+Resources:
+  NatPublicIP:
+        Type: "AWS::EC2::EIP"
+        Properties:
+          Domain: vpc
+
+  NatGateway:
+        Type: "AWS::EC2::NatGateway"
+        DependsOn: NatPublicIP
+        Properties: 
+          AllocationId: !GetAtt NatPublicIP.AllocationId
+          SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+        Type: 'AWS::EC2::RouteTable'
+        Properties:
+          VpcId: !Ref MyVPC
+          Tags:
+            - Key: Network
+              Value: Private
+
+  PrivateRoute:
+        Type: 'AWS::EC2::Route'
+        Properties:
+          RouteTableId: !Ref PrivateRouteTable
+          DestinationCidrBlock: 0.0.0.0/0
+          NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+          SubnetId: !Ref PrivateSubnet1
+          RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+        Type: 'AWS::EC2::SubnetRouteTableAssociation'
+        Properties:
+          SubnetId: !Ref PrivateSubnet2
+          RouteTableId: !Ref PrivateRouteTable
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: CloudFormation managed DB subnet group.
+      SubnetIds: 
+        - Ref: PrivateSubnet1
+        - Ref: PrivateSubnet2
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: postgres
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !If [isRestore, !Ref "AWS::NoValue", !Ref DatabaseUser]
+      MasterUserPassword: !If [isRestore, !Ref "AWS::NoValue", !Ref DatabasePassword]
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: 01:00-02:00
+      PreferredMaintenanceWindow: mon:03:00-mon:04:00
+      DBSubnetGroupName: !Ref "DatabaseSubnetGroup"
+      VpcSecurityGroupIds:
+        - Ref: 'DBSecurityGroup'
+      SnapshotIdentifier: !If [isRestore, !Ref SnapToRestore, !Ref "AWS::NoValue"]
+
+  DatabasePrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      DBClusterIdentifier: !Ref "DatabaseCluster"
+      DBInstanceClass: !Ref DBInstanceType
+      DBSubnetGroupName: !Ref "DatabaseSubnetGroup"
+      
+  DatabaseReplicaInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      DBClusterIdentifier: !Ref "DatabaseCluster"
+      DBInstanceClass: !Ref DBInstanceType
+      DBSubnetGroupName: !Ref "DatabaseSubnetGroup"
+  
+  LoadBalancerApp:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets: 
+        - Ref: PrivateSubnet1
+        - Ref: PrivateSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSG
+
+  LBListenerApp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancerApp
+      - TargetGroupApp
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref TargetGroupApp
+      LoadBalancerArn: !Ref LoadBalancerApp
+      Port: 8080
+      Protocol: HTTP
+
+  TargetGroupApp:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      HealthCheckPath: /api/status
+      Targets:
+        - Id: !Ref EC2InstanceApp
+        - Id: !Ref EC2InstanceApp2
+      VpcId: !Ref MyVPC
+
+  LoadBalancerWeb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets: 
+        - Ref: PrivateSubnet1
+        - Ref: PrivateSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSG
+
+  LBListenerWeb:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancerWeb
+      - TargetGroupWeb
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref TargetGroupWeb
+      LoadBalancerArn: !Ref LoadBalancerWeb
+      Port: 80
+      Protocol: HTTP
+
+  TargetGroupWeb:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: /
+      Targets:
+        - Id: !Ref EC2InstanceWeb
+        - Id: !Ref EC2InstanceWeb2
+      VpcId: !Ref MyVPC
+
+  EC2InstanceWeb:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds: 
+        - !GetAtt MySecurityGroup.GroupId
+      SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: Screening-web
+      KeyName: !Ref KeyName
+      UserData:
+        'Fn::Base64': 
+          !Sub |
+            #!/bin/bash -xe            
+            # Ensure AWS CFN Bootstrap is the latest
+            yum update -y aws-cfn-bootstrap
+            # Install the files and packages from the metadata
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceWeb --configsets sscweb --region ${AWS::Region}
+            yum update -y
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2InstanceWeb --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          sscweb:
+            - "configure_cfn"
+            - "install_web"
+            - "config_web"
+        configure_cfn:
+          files:
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.EC2.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceWeb --configsets sscweb --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                verbose=true
+                interval=5
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:  
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+        install_web:
+          packages: 
+            yum:
+              nodejs: []
+              npm: []
+        config_web:
+          commands:
+            01_makedirectory:
+              cwd: "/var/www/html"
+              command: "mkdir -p screening"
+            02_downloaddist:
+              cwd: "/var/www/html/screening"
+              command: "wget https://devops-screening.s3.amazonaws.com/screening.zip"    
+            03_extractdist:
+              cwd: "/var/www/html/screening"
+              command: |                
+                unzip screening.zip
+                mv screening/* .
+                sleep 5
+                rm -rf screening.zip
+            04_startserver:
+              cwd: "/var/www/html/screening/web"
+              command: "PORT=80 API_HOST=${LoadBalancerWeb.DNSName} node app.js"
+
+  EC2InstanceWeb2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds: 
+        - !GetAtt MySecurityGroup.GroupId
+      SubnetId: !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: Screening-web2
+      KeyName: !Ref KeyName
+      UserData:
+        'Fn::Base64': 
+          !Sub |
+            #!/bin/bash -xe            
+            # Ensure AWS CFN Bootstrap is the latest
+            yum update -y aws-cfn-bootstrap
+            # Install the files and packages from the metadata
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceWeb2 --configsets sscweb --region ${AWS::Region}
+            yum update -y
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2InstanceWeb2 --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          sscweb:
+            - "configure_cfn"
+            - "install_web"
+            - "config_web"
+        configure_cfn:
+          files:
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.EC2.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceWeb2 --configsets sscweb --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                verbose=true
+                interval=5
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:  
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+        install_web:
+          packages: 
+            yum:
+              nodejs: []
+              npm: []
+        config_web:
+          commands:
+            01_makedirectory:
+              cwd: "/var/www/html"
+              command: "mkdir -p screening"
+            02_downloaddist:
+              cwd: "/var/www/html/screening"
+              command: "wget https://devops-screening.s3.amazonaws.com/screening.zip"    
+            03_extractdist:
+              cwd: "/var/www/html/screening"
+              command: |                
+                unzip screening.zip
+                mv screening/* .
+                sleep 5
+                rm -rf screening.zip
+            04_startserver:
+              cwd: "/var/www/html/screening/web"
+              command: "PORT=80 API_HOST=${LoadBalancerWeb.DNSName} node app.js"
+
+  EC2InstanceApp:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds: 
+        - !GetAtt MySecurityGroup.GroupId
+      SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - Key: Name
+          Value: Screening-App
+      KeyName: !Ref KeyName
+      UserData:
+        'Fn::Base64': 
+          !Sub |
+            #!/bin/bash -xe            
+            # Ensure AWS CFN Bootstrap is the latest
+            yum update -y aws-cfn-bootstrap
+            # Install the files and packages from the metadata
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceApp --configsets sscapp --region ${AWS::Region}
+            yum update -y
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2InstanceApp --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          sscapp:
+            - "configure_cfn"
+            - "install_app"
+            - "config_app"
+        configure_cfn:
+          files:
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.EC2.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceApp --configsets sscapp --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                verbose=true
+                interval=5
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:  
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+        install_web:
+          packages: 
+            yum:
+              nodejs: []
+              npm: []
+        config_web:
+          commands:
+            01_makedirectory:
+              cwd: "/var/www/html"
+              command: "mkdir -p screening"
+            02_downloaddist:
+              cwd: "/var/www/html/screening"
+              command: "wget https://devops-screening.s3.amazonaws.com/screening.zip"    
+            03_extractdist:
+              cwd: "/var/www/html/screening"
+              command: |                
+                unzip screening.zip
+                mv screening/* .
+                sleep 5
+                rm -rf screening.zip
+            04_startserver:
+              cwd: "/var/www/html/screening/api"
+              command: "PORT=8080 DB={postgres://$DatabaseUser:$DatabasePassword@$DatabaseCluster.Endpoint.Address}:5432/$DatabaseName} node app.js"
+
+  EC2InstanceApp2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds: 
+        - !GetAtt MySecurityGroup.GroupId
+      SubnetId: !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: Screening-App2
+      KeyName: !Ref KeyName
+      UserData:
+        'Fn::Base64': 
+          !Sub |
+            #!/bin/bash -xe            
+            # Ensure AWS CFN Bootstrap is the latest
+            yum update -y aws-cfn-bootstrap
+            # Install the files and packages from the metadata
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceApp2 --configsets sscapp --region ${AWS::Region}
+            yum update -y
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2InstanceApp2 --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: "1"
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          sscapp:
+            - "configure_cfn"
+            - "install_app"
+            - "config_app"
+        configure_cfn:
+          files:
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.EC2.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2InstanceApp2 --configsets sscapp --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                verbose=true
+                interval=5
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:  
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/cfn/cfn-hup.conf"
+                  - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+        install_web:
+          packages: 
+            yum:
+              nodejs: []
+              npm: []
+        config_web:
+          commands:
+            01_makedirectory:
+              cwd: "/var/www/html"
+              command: "mkdir -p screening"
+            02_downloaddist:
+              cwd: "/var/www/html/screening"
+              command: "wget https://devops-screening.s3.amazonaws.com/screening.zip"    
+            03_extractdist:
+              cwd: "/var/www/html/screening"
+              command: |                
+                unzip screening.zip
+                mv screening/* .
+                sleep 5
+                rm -rf screening.zip
+            04_startserver:
+              cwd: "/var/www/html/screening/api"
+              command: "PORT=8080 DB={postgres://$DatabaseUser:$DatabasePassword@$DatabaseCluster.Endpoint.Address}:5432/$DatabaseName} node app.js"
+
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Open Port 80 and 8080
+      VpcId : !Ref MyVPC      
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        SourceSecurityGroupId: !GetAtt LoadBalancerSG.GroupId
+      - IpProtocol: tcp
+        FromPort: '8080'
+        ToPort: '8080'
+        SourceSecurityGroupId: !GetAtt LoadBalancerSG.GroupId
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'DB security group for ssc dashboard'
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: 'tcp'
+          FromPort: 5432                      
+          ToPort: 5432                      
+          SourceSecurityGroupId: !Ref MySecurityGroup
+ 
+  LoadBalancerSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Load balancer security group"
+      VpcId: !Ref MyVPC      
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          SourceSecurityGroupId: !Ref SSHLocation
+          FromPort: 80
+          ToPort: 80
+        - IpProtocol: "tcp"
+          SourceSecurityGroupId: !Ref SSHLocation
+          FromPort: 443
+          ToPort: 443
+
+Outputs:
+  DashboardURL:
+    Description: Screening Web URL
+    Value: !Sub 'http://${LoadBalancerWeb.DNSName}'
